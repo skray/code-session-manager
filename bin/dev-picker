@@ -4,6 +4,7 @@
 # Loops so it comes back after each selection
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DEV_DIR="$HOME/dev"
 
 get_main_client() {
     tmux list-clients -F '#{client_tty}|#{session_name}' 2>/dev/null | grep -v '|_picker$' | head -1 | cut -d'|' -f1
@@ -24,28 +25,28 @@ create_session() {
     local name="$1"
     local dir="$2"
 
-    if tmux has-session -t "$name" 2>/dev/null; then
+    # Sanitize session name for tmux (replace / and . with -)
+    name=$(echo "$name" | tr '/.' '--')
+
+    if tmux has-session -t "=$name" 2>/dev/null; then
+        # Session exists, just switch to it
+        local main_client
+        main_client=$(get_main_client)
+        if [ -n "$main_client" ]; then
+            tmux switch-client -c "$main_client" -t "$name" 2>/dev/null
+        fi
         return 0
     fi
 
     [ ! -d "$dir" ] && mkdir -p "$dir"
 
-    # Create session with first pane (Claude Code)
     tmux new-session -d -s "$name" -c "$dir"
-
-    # Split horizontally — bottom pane for shell
     tmux split-window -t "$name" -v -c "$dir"
-
-    # Resize top pane to ~70%
     tmux resize-pane -t "$name:1.1" -y 70%
-
-    # Send claude to the top pane
     tmux send-keys -t "$name:1.1" 'claude' Enter
 
-    # Open VS Code for this project
     "$SCRIPT_DIR/dev-code-switch" "$dir"
 
-    # Switch the main client to the new session
     local main_client
     main_client=$(get_main_client)
     if [ -n "$main_client" ]; then
@@ -53,18 +54,115 @@ create_session() {
     fi
 }
 
-prompt_new_session() {
-    printf "Session name: "
-    read -r name
-    if [ -n "$name" ]; then
-        printf "Directory [~/dev/%s]: " "$name"
-        read -r dir
-        dir="${dir:-$HOME/dev/$name}"
-        dir="${dir/#\~/$HOME}"
-        create_session "$name" "$dir"
+pick_project() {
+    # Step 1: Pick a project from ~/dev (only directories, exclude dotfiles and worktree dirs)
+    local project
+    project=$(ls -1 "$DEV_DIR" | while read -r d; do
+        # Only show directories, skip dotfiles, skip worktree dirs (contain a dot after project name)
+        [ -d "$DEV_DIR/$d" ] || continue
+        [[ "$d" == .* ]] && continue
+        # Skip if it looks like a worktree (project.branch pattern where project also exists)
+        if [[ "$d" == *.* ]]; then
+            local base="${d%%.*}"
+            [ -d "$DEV_DIR/$base" ] && continue
+        fi
+        echo "$d"
+    done | fzf \
+        --header="Pick a project (Esc to cancel)" \
+        --no-sort \
+        --reverse \
+        --no-info \
+        --prompt="project ▶ " \
+        --pointer="→" \
+        --color="pointer:green,prompt:green" \
+    )
+
+    [ -z "$project" ] && return
+
+    # Step 2: Build options list
+    local options=""
+    options="Open directly"$'\n'"Create new worktree"
+
+    # Find existing worktrees for this project
+    local worktrees=""
+    if [ -d "$DEV_DIR/$project" ] && git -C "$DEV_DIR/$project" rev-parse --git-dir &>/dev/null; then
+        worktrees=$(git -C "$DEV_DIR/$project" worktree list --porcelain 2>/dev/null | grep "^worktree " | sed 's/^worktree //' | while read -r wt_path; do
+            # Skip the main worktree itself
+            [ "$wt_path" = "$DEV_DIR/$project" ] && continue
+            # Skip codex worktrees
+            [[ "$wt_path" == */.codex/* ]] && continue
+            # Show just the branch/folder name
+            basename "$wt_path"
+        done)
     fi
+
+    if [ -n "$worktrees" ]; then
+        options="$options"$'\n'"$worktrees"
+    fi
+
+    # Step 3: Pick an option
+    local choice
+    choice=$(echo "$options" | fzf \
+        --header="── $project ──────────" \
+        --no-sort \
+        --reverse \
+        --no-info \
+        --prompt="▶ " \
+        --pointer="→" \
+        --color="pointer:green,prompt:green" \
+    )
+
+    [ -z "$choice" ] && return
+
+    case "$choice" in
+        "Open directly")
+            create_session "$project" "$DEV_DIR/$project"
+            ;;
+        "Create new worktree")
+            printf "Branch name: "
+            read -r branch
+            [ -z "$branch" ] && return
+            # Use wt to create the worktree
+            (cd "$DEV_DIR/$project" && wt switch --create "$branch" --no-cd --yes 2>&1)
+            # Figure out the worktree path
+            local wt_path
+            wt_path=$(git -C "$DEV_DIR/$project" worktree list --porcelain 2>/dev/null | grep -A0 "^worktree .*${branch}" | sed 's/^worktree //' | head -1)
+            if [ -n "$wt_path" ] && [ -d "$wt_path" ]; then
+                create_session "$project/$branch" "$wt_path"
+            else
+                # Fallback: try the common pattern
+                wt_path="$DEV_DIR/${project}.${branch}"
+                if [ -d "$wt_path" ]; then
+                    create_session "$project/$branch" "$wt_path"
+                else
+                    echo "Could not find worktree path for $branch"
+                    sleep 2
+                fi
+            fi
+            ;;
+        *)
+            # Selected an existing worktree
+            local wt_path
+            wt_path=$(git -C "$DEV_DIR/$project" worktree list --porcelain 2>/dev/null | grep "^worktree .*${choice}$" | sed 's/^worktree //' | head -1)
+            if [ -z "$wt_path" ]; then
+                # Fallback: try common patterns
+                if [ -d "$DEV_DIR/${project}.${choice}" ]; then
+                    wt_path="$DEV_DIR/${project}.${choice}"
+                elif [ -d "$DEV_DIR/${project}/${choice}" ]; then
+                    wt_path="$DEV_DIR/${project}/${choice}"
+                fi
+            fi
+            if [ -n "$wt_path" ] && [ -d "$wt_path" ]; then
+                create_session "$project/$choice" "$wt_path"
+            else
+                echo "Could not find worktree: $choice"
+                sleep 2
+            fi
+            ;;
+    esac
 }
 
+# Main loop
 while true; do
     clear
     sessions=$(format_sessions)
@@ -74,7 +172,7 @@ while true; do
         echo ""
         echo "Press Enter to create one, or Ctrl-C to quit."
         read -r
-        prompt_new_session
+        pick_project
         continue
     fi
 
@@ -102,7 +200,7 @@ while true; do
             break
             ;;
         n)
-            prompt_new_session
+            pick_project
             ;;
         x)
             if [ -n "$selected_name" ]; then
