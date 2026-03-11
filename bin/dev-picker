@@ -1,0 +1,121 @@
+#!/bin/bash
+# Persistent picker for tmux dev sessions
+# Uses fzf for reliable mouse/keyboard interaction
+# Loops so it comes back after each selection
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+get_main_client() {
+    tmux list-clients -F '#{client_tty}|#{session_name}' 2>/dev/null | grep -v '|_picker$' | head -1 | cut -d'|' -f1
+}
+
+format_sessions() {
+    tmux list-sessions -F '#{session_name}|#{session_path}|#{session_attached}' 2>/dev/null | grep -v '^_picker|' | while IFS='|' read -r name path attached; do
+        short_path=$(echo "$path" | sed "s|$HOME|~|")
+        if [ "$attached" = "1" ]; then
+            printf "● %-18s %s\n" "$name" "$short_path"
+        else
+            printf "  %-18s %s\n" "$name" "$short_path"
+        fi
+    done
+}
+
+create_session() {
+    local name="$1"
+    local dir="$2"
+
+    if tmux has-session -t "$name" 2>/dev/null; then
+        return 0
+    fi
+
+    [ ! -d "$dir" ] && mkdir -p "$dir"
+
+    # Create session with first pane (Claude Code)
+    tmux new-session -d -s "$name" -c "$dir"
+
+    # Split horizontally — bottom pane for shell
+    tmux split-window -t "$name" -v -c "$dir"
+
+    # Resize top pane to ~70%
+    tmux resize-pane -t "$name:1.1" -y 70%
+
+    # Send claude to the top pane
+    tmux send-keys -t "$name:1.1" 'claude' Enter
+
+    # Open VS Code for this project
+    "$SCRIPT_DIR/dev-code-switch" "$dir"
+
+    # Switch the main client to the new session
+    local main_client
+    main_client=$(get_main_client)
+    if [ -n "$main_client" ]; then
+        tmux switch-client -c "$main_client" -t "$name" 2>/dev/null
+    fi
+}
+
+prompt_new_session() {
+    printf "Session name: "
+    read -r name
+    if [ -n "$name" ]; then
+        printf "Directory [~/dev/%s]: " "$name"
+        read -r dir
+        dir="${dir:-$HOME/dev/$name}"
+        dir="${dir/#\~/$HOME}"
+        create_session "$name" "$dir"
+    fi
+}
+
+while true; do
+    clear
+    sessions=$(format_sessions)
+
+    if [ -z "$sessions" ]; then
+        echo "No active sessions."
+        echo ""
+        echo "Press Enter to create one, or Ctrl-C to quit."
+        read -r
+        prompt_new_session
+        continue
+    fi
+
+    choice=$(echo "$sessions" | fzf \
+        --header="n:new  x:kill  q:quit" \
+        --no-sort \
+        --cycle \
+        --reverse \
+        --no-info \
+        --bind="n:abort" \
+        --bind="x:abort" \
+        --bind="q:abort" \
+        --expect="n,x,q" \
+        --prompt="▶ " \
+        --pointer="→" \
+        --color="pointer:green,prompt:green" \
+    )
+
+    key=$(echo "$choice" | head -1)
+    selection=$(echo "$choice" | tail -1)
+    selected_name=$(echo "$selection" | sed 's/^[● ]*//' | awk '{print $1}')
+
+    case "$key" in
+        q)
+            break
+            ;;
+        n)
+            prompt_new_session
+            ;;
+        x)
+            if [ -n "$selected_name" ]; then
+                tmux kill-session -t "$selected_name" 2>/dev/null
+            fi
+            ;;
+        *)
+            if [ -n "$selected_name" ]; then
+                client=$(get_main_client)
+                if [ -n "$client" ]; then
+                    tmux switch-client -c "$client" -t "$selected_name" 2>/dev/null
+                fi
+            fi
+            ;;
+    esac
+done

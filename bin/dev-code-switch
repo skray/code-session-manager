@@ -1,0 +1,6 @@
+#!/bin/bash
+# Focus the VS Code window for a given directory, or open a new one
+# Mimics running "code ." from within that directory
+dir="$1"
+[ -z "$dir" ] && exit 0
+code "$dir" &

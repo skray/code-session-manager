@@ -1,0 +1,55 @@
+#!/bin/bash
+# Start the dev environment in a single Ghostty window
+# Left pane: session picker | Right pane: tmux
+#
+# Just run: dev-start
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Start tmux server if not running
+tmux start-server 2>/dev/null
+
+# Create a default work session if no sessions exist (excluding _picker)
+session_count=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -v '^_picker$' | wc -l | tr -d ' ')
+if [ "$session_count" -eq 0 ]; then
+    tmux new-session -d -s scratch -c "$HOME/dev"
+fi
+
+# Kill _picker session if it exists (picker will run outside tmux now)
+tmux kill-session -t _picker 2>/dev/null
+
+# Find first non-picker session
+first_session=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -v '^_picker$' | head -1)
+
+# Use AppleScript to set up the Ghostty window with two panes
+osascript <<EOF
+tell application "Ghostty"
+    activate
+end tell
+
+delay 0.5
+
+tell application "System Events"
+    tell process "Ghostty"
+        -- Type picker command in the first (left) pane
+        keystroke "$SCRIPT_DIR/dev-picker"
+        key code 36 -- Enter
+
+        -- Cmd+D to split right
+        delay 0.3
+        keystroke "d" using command down
+
+        -- Type tmux attach in the right pane
+        delay 0.3
+        keystroke "tmux attach -t $first_session"
+        key code 36 -- Enter
+
+        -- Resize: shrink the left pane by pressing Cmd+Ctrl+Left several times
+        delay 0.3
+        repeat 15 times
+            key code 123 using {command down, control down}
+            delay 0.05
+        end repeat
+    end tell
+end tell
+EOF
