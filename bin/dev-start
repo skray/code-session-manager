@@ -41,7 +41,7 @@ tell application "System Events"
 
         -- Type tmux attach in the right pane
         delay 0.3
-        keystroke "tmux attach -t $first_session"
+        keystroke "exec tmux attach -t $first_session"
         key code 36 -- Enter
 
         -- Resize: shrink the left pane by pressing Cmd+Ctrl+Left several times

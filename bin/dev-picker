@@ -43,7 +43,7 @@ create_session() {
     tmux new-session -d -s "$name" -c "$dir"
     tmux split-window -t "$name" -v -c "$dir"
     tmux resize-pane -t "$name:1.1" -y 70%
-    tmux send-keys -t "$name:1.1" 'claude' Enter
+    tmux send-keys -t "$name:1.1" 'claude --dangerously-skip-permissions' Enter
 
     "$SCRIPT_DIR/dev-code-switch" "$dir"
 
@@ -81,7 +81,7 @@ pick_project() {
 
     # Step 2: Build options list
     local options=""
-    options="Open directly"$'\n'"Create new worktree"
+    options="Open directly"$'\n'"New worktree"
 
     # Find existing worktrees for this project
     local worktrees=""
@@ -118,26 +118,54 @@ pick_project() {
         "Open directly")
             create_session "$project" "$DEV_DIR/$project"
             ;;
-        "Create new worktree")
+        "New worktree")
             printf "Branch name: "
             read -r branch
             [ -z "$branch" ] && return
-            # Use wt to create the worktree
-            (cd "$DEV_DIR/$project" && wt switch --create "$branch" --no-cd --yes 2>&1)
-            # Figure out the worktree path
+
+            LOG="/tmp/dev-picker-debug.log"
+            echo "=== $(date) ===" >> "$LOG"
+            echo "project=$project branch=$branch" >> "$LOG"
+
+            # Fetch first so remote branches are available
+            echo "Fetching..." >> "$LOG"
+            (cd "$DEV_DIR/$project" && git fetch --quiet 2>>"$LOG")
+
+            # Check if branch exists (local or remote)
+            local branch_exists=false
+            if git -C "$DEV_DIR/$project" rev-parse --verify "$branch" &>/dev/null; then
+                echo "Branch exists locally" >> "$LOG"
+                branch_exists=true
+            elif git -C "$DEV_DIR/$project" rev-parse --verify "origin/$branch" &>/dev/null; then
+                echo "Branch exists on remote" >> "$LOG"
+                branch_exists=true
+            else
+                echo "Branch does not exist" >> "$LOG"
+            fi
+
+            local wt_output
+            if [ "$branch_exists" = true ]; then
+                echo "Running: wt switch $branch --no-cd --yes" >> "$LOG"
+                wt_output=$(cd "$DEV_DIR/$project" && wt switch "$branch" --no-cd --yes 2>&1)
+            else
+                echo "Running: wt switch --create $branch --base origin/main --no-cd --yes" >> "$LOG"
+                wt_output=$(cd "$DEV_DIR/$project" && wt switch --create "$branch" --base origin/main --no-cd --yes 2>&1)
+            fi
+            echo "wt output: $wt_output" >> "$LOG"
+
+            # Extract path from wt output (looks like: "... @ ~/dev/ai-platform.branch-name")
             local wt_path
-            wt_path=$(git -C "$DEV_DIR/$project" worktree list --porcelain 2>/dev/null | grep -A0 "^worktree .*${branch}" | sed 's/^worktree //' | head -1)
+            wt_path=$(echo "$wt_output" | grep -o '@ .*' | sed 's/^@ //' | sed "s|^~/|$HOME/|" | head -1)
+            echo "wt_path from output=$wt_path" >> "$LOG"
+
             if [ -n "$wt_path" ] && [ -d "$wt_path" ]; then
+                echo "Found worktree, creating session" >> "$LOG"
                 create_session "$project/$branch" "$wt_path"
             else
-                # Fallback: try the common pattern
-                wt_path="$DEV_DIR/${project}.${branch}"
-                if [ -d "$wt_path" ]; then
-                    create_session "$project/$branch" "$wt_path"
-                else
-                    echo "Could not find worktree path for $branch"
-                    sleep 2
-                fi
+                echo "FAILED: Could not resolve worktree path" >> "$LOG"
+                echo "Could not find worktree path for $branch"
+                echo "wt said: $wt_output"
+                sleep 3
             fi
             ;;
         *)
@@ -146,10 +174,10 @@ pick_project() {
             wt_path=$(git -C "$DEV_DIR/$project" worktree list --porcelain 2>/dev/null | grep "^worktree .*${choice}$" | sed 's/^worktree //' | head -1)
             if [ -z "$wt_path" ]; then
                 # Fallback: try common patterns
-                if [ -d "$DEV_DIR/${project}.${choice}" ]; then
+                if [ -d "$HOME/dev/worktrees/${project}/${choice}" ]; then
+                    wt_path="$HOME/dev/worktrees/${project}/${choice}"
+                elif [ -d "$DEV_DIR/${project}.${choice}" ]; then
                     wt_path="$DEV_DIR/${project}.${choice}"
-                elif [ -d "$DEV_DIR/${project}/${choice}" ]; then
-                    wt_path="$DEV_DIR/${project}/${choice}"
                 fi
             fi
             if [ -n "$wt_path" ] && [ -d "$wt_path" ]; then
@@ -197,6 +225,13 @@ while true; do
 
     case "$key" in
         q)
+            # Detach the tmux client in the right pane — this exits the
+            # "tmux attach" command that dev-start launched, closing the shell
+            # and the Ghostty split with it
+            client=$(get_main_client)
+            if [ -n "$client" ]; then
+                tmux detach-client -t "$client" 2>/dev/null
+            fi
             break
             ;;
         n)
@@ -204,6 +239,21 @@ while true; do
             ;;
         x)
             if [ -n "$selected_name" ]; then
+                # If the main client is on this session, switch it elsewhere first
+                client=$(get_main_client)
+                if [ -n "$client" ]; then
+                    current=$(tmux display-message -t "$client" -p '#{session_name}' 2>/dev/null)
+                    if [ "$current" = "$selected_name" ]; then
+                        # Find another session to switch to
+                        other=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -v "^${selected_name}$" | grep -v '^_picker$' | head -1)
+                        if [ -n "$other" ]; then
+                            tmux switch-client -c "$client" -t "$other" 2>/dev/null
+                        else
+                            # Last session — detach instead of killing
+                            tmux detach-client -t "$client" 2>/dev/null
+                        fi
+                    fi
+                fi
                 tmux kill-session -t "$selected_name" 2>/dev/null
             fi
             ;;
