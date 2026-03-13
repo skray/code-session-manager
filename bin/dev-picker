@@ -128,8 +128,9 @@ pick_project() {
             echo "project=$project branch=$branch" >> "$LOG"
 
             # Fetch first so remote branches are available
+            echo "Fetching $project..."
             echo "Fetching..." >> "$LOG"
-            (cd "$DEV_DIR/$project" && git fetch --quiet 2>>"$LOG")
+            (cd "$DEV_DIR/$project" && git fetch 2>&1) | tee -a "$LOG"
 
             # Check if branch exists (local or remote)
             local branch_exists=false
@@ -143,28 +144,30 @@ pick_project() {
                 echo "Branch does not exist" >> "$LOG"
             fi
 
-            local wt_output
+            # Run wt with visible output so user sees progress (npm install, etc.)
+            echo "Creating worktree for $branch..."
             if [ "$branch_exists" = true ]; then
                 echo "Running: wt switch $branch --no-cd --yes" >> "$LOG"
-                wt_output=$(cd "$DEV_DIR/$project" && wt switch "$branch" --no-cd --yes 2>&1)
+                (cd "$DEV_DIR/$project" && wt switch "$branch" --no-cd --yes 2>&1) | tee -a "$LOG"
             else
                 echo "Running: wt switch --create $branch --base origin/main --no-cd --yes" >> "$LOG"
-                wt_output=$(cd "$DEV_DIR/$project" && wt switch --create "$branch" --base origin/main --no-cd --yes 2>&1)
+                (cd "$DEV_DIR/$project" && wt switch --create "$branch" --base origin/main --no-cd --yes 2>&1) | tee -a "$LOG"
             fi
-            echo "wt output: $wt_output" >> "$LOG"
+            local wt_exit=${PIPESTATUS[0]}
+            echo "wt exit code: $wt_exit" >> "$LOG"
 
-            # Extract path from wt output (looks like: "... @ ~/dev/ai-platform.branch-name")
+            # Find the worktree path from git (reliable, ignores wt output noise)
             local wt_path
-            wt_path=$(echo "$wt_output" | grep -o '@ .*' | sed 's/^@ //' | sed "s|^~/|$HOME/|" | head -1)
-            echo "wt_path from output=$wt_path" >> "$LOG"
+            wt_path=$(git -C "$DEV_DIR/$project" worktree list --porcelain 2>/dev/null | grep "^worktree " | sed 's/^worktree //' | grep "$branch" | head -1)
+            echo "wt_path from git worktree list=$wt_path" >> "$LOG"
 
             if [ -n "$wt_path" ] && [ -d "$wt_path" ]; then
                 echo "Found worktree, creating session" >> "$LOG"
                 create_session "$project/$branch" "$wt_path"
             else
                 echo "FAILED: Could not resolve worktree path" >> "$LOG"
-                echo "Could not find worktree path for $branch"
-                echo "wt said: $wt_output"
+                echo "Could not find worktree path for $branch (wt exit: $wt_exit)"
+                echo "Check log: $LOG"
                 sleep 3
             fi
             ;;
@@ -210,9 +213,9 @@ while true; do
         --cycle \
         --reverse \
         --no-info \
-        --bind="n:abort" \
-        --bind="x:abort" \
-        --bind="q:abort" \
+        --bind="n:accept" \
+        --bind="x:accept" \
+        --bind="q:accept" \
         --expect="n,x,q" \
         --prompt="▶ " \
         --pointer="→" \
