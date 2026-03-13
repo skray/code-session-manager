@@ -86,14 +86,10 @@ pick_project() {
     # Find existing worktrees for this project
     local worktrees=""
     if [ -d "$DEV_DIR/$project" ] && git -C "$DEV_DIR/$project" rev-parse --git-dir &>/dev/null; then
-        worktrees=$(git -C "$DEV_DIR/$project" worktree list --porcelain 2>/dev/null | grep "^worktree " | sed 's/^worktree //' | while read -r wt_path; do
-            # Skip the main worktree itself
-            [ "$wt_path" = "$DEV_DIR/$project" ] && continue
-            # Skip codex worktrees
-            [[ "$wt_path" == */.codex/* ]] && continue
-            # Show just the branch/folder name
-            basename "$wt_path"
-        done)
+        worktrees=$(git -C "$DEV_DIR/$project" worktree list --porcelain 2>/dev/null | awk -v main="$DEV_DIR/$project" '
+            /^worktree / { path = substr($0, 10) }
+            /^branch /   { if (path != main && path !~ /\/.codex\//) print substr($0, 19) }
+        ')
     fi
 
     if [ -n "$worktrees" ]; then
@@ -156,9 +152,13 @@ pick_project() {
             local wt_exit=${PIPESTATUS[0]}
             echo "wt exit code: $wt_exit" >> "$LOG"
 
-            # Find the worktree path from git (reliable, ignores wt output noise)
+            # Find the worktree path from git by matching branch name in porcelain output
+            # (path may not contain the branch name, e.g. .claude/worktrees/random-name)
             local wt_path
-            wt_path=$(git -C "$DEV_DIR/$project" worktree list --porcelain 2>/dev/null | grep "^worktree " | sed 's/^worktree //' | grep "$branch" | head -1)
+            wt_path=$(git -C "$DEV_DIR/$project" worktree list --porcelain 2>/dev/null | awk -v b="$branch" '
+                /^worktree / { path = substr($0, 10) }
+                /^branch /   { if (substr($0, 8) == "refs/heads/" b) print path }
+            ' | head -1)
             echo "wt_path from git worktree list=$wt_path" >> "$LOG"
 
             if [ -n "$wt_path" ] && [ -d "$wt_path" ]; then
@@ -172,17 +172,12 @@ pick_project() {
             fi
             ;;
         *)
-            # Selected an existing worktree
+            # Selected an existing worktree — look up path by branch name
             local wt_path
-            wt_path=$(git -C "$DEV_DIR/$project" worktree list --porcelain 2>/dev/null | grep "^worktree .*${choice}$" | sed 's/^worktree //' | head -1)
-            if [ -z "$wt_path" ]; then
-                # Fallback: try common patterns
-                if [ -d "$HOME/dev/worktrees/${project}/${choice}" ]; then
-                    wt_path="$HOME/dev/worktrees/${project}/${choice}"
-                elif [ -d "$DEV_DIR/${project}.${choice}" ]; then
-                    wt_path="$DEV_DIR/${project}.${choice}"
-                fi
-            fi
+            wt_path=$(git -C "$DEV_DIR/$project" worktree list --porcelain 2>/dev/null | awk -v b="$choice" '
+                /^worktree / { path = substr($0, 10) }
+                /^branch /   { if (substr($0, 8) == "refs/heads/" b) print path }
+            ' | head -1)
             if [ -n "$wt_path" ] && [ -d "$wt_path" ]; then
                 create_session "$project/$choice" "$wt_path"
             else
