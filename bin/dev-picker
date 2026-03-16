@@ -40,7 +40,12 @@ create_session() {
 
     [ ! -d "$dir" ] && mkdir -p "$dir"
 
-    tmux new-session -d -s "$name" -c "$dir"
+    if ! tmux new-session -d -s "$name" -c "$dir" 2>&1; then
+        echo "ERROR: tmux new-session failed for '$name' in $dir"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+
     tmux split-window -t "$name" -v -c "$dir"
     tmux resize-pane -t "$name:1.1" -y 70%
     tmux send-keys -t "$name:1.1" 'claude --dangerously-skip-permissions' Enter
@@ -77,7 +82,11 @@ pick_project() {
         --color="pointer:green,prompt:green" \
     )
 
-    [ -z "$project" ] && return
+    if [ -z "$project" ]; then
+        echo "No project selected."
+        sleep 1
+        return
+    fi
 
     # Step 2: Build options list
     local options=""
@@ -108,7 +117,11 @@ pick_project() {
         --color="pointer:green,prompt:green" \
     )
 
-    [ -z "$choice" ] && return
+    if [ -z "$choice" ]; then
+        echo "No option selected."
+        sleep 1
+        return
+    fi
 
     case "$choice" in
         "Open directly")
@@ -117,7 +130,11 @@ pick_project() {
         "New worktree")
             printf "Branch name: "
             read -r branch
-            [ -z "$branch" ] && return
+            if [ -z "$branch" ]; then
+                echo "No branch name entered."
+                sleep 1
+                return
+            fi
 
             LOG="/tmp/dev-picker-debug.log"
             echo "=== $(date) ===" >> "$LOG"
@@ -166,9 +183,10 @@ pick_project() {
                 create_session "$project/$branch" "$wt_path"
             else
                 echo "FAILED: Could not resolve worktree path" >> "$LOG"
-                echo "Could not find worktree path for $branch (wt exit: $wt_exit)"
+                echo ""
+                echo "ERROR: Could not find worktree path for $branch (wt exit: $wt_exit)"
                 echo "Check log: $LOG"
-                sleep 3
+                read -rp "Press Enter to continue..."
             fi
             ;;
         *)
@@ -181,8 +199,9 @@ pick_project() {
             if [ -n "$wt_path" ] && [ -d "$wt_path" ]; then
                 create_session "$project/$choice" "$wt_path"
             else
-                echo "Could not find worktree: $choice"
-                sleep 2
+                echo ""
+                echo "ERROR: Could not find worktree: $choice"
+                read -rp "Press Enter to continue..."
             fi
             ;;
     esac
@@ -202,24 +221,26 @@ while true; do
         continue
     fi
 
+    PICKER_KEY=$(mktemp)
+    echo "" > "$PICKER_KEY"
+
     choice=$(echo "$sessions" | fzf \
         --header="n:new  x:kill  q:quit" \
         --no-sort \
         --cycle \
         --reverse \
         --no-info \
-        --bind="n:accept" \
-        --bind="x:accept" \
-        --bind="q:accept" \
-        --expect="n,x,q" \
+        --bind="n:execute-silent(echo n > $PICKER_KEY)+abort" \
+        --bind="x:execute-silent(echo x > $PICKER_KEY)+accept" \
+        --bind="q:execute-silent(echo q > $PICKER_KEY)+abort" \
         --prompt="▶ " \
         --pointer="→" \
         --color="pointer:green,prompt:green" \
     )
 
-    key=$(echo "$choice" | head -1)
-    selection=$(echo "$choice" | tail -1)
-    selected_name=$(echo "$selection" | sed 's/^[● ]*//' | awk '{print $1}')
+    key=$(cat "$PICKER_KEY" 2>/dev/null)
+    rm -f "$PICKER_KEY"
+    selected_name=$(echo "$choice" | sed 's/^[● ]*//' | awk '{print $1}')
 
     case "$key" in
         q)
