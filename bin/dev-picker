@@ -1,9 +1,10 @@
 #!/bin/bash
 # Persistent picker for tmux dev sessions
-# Uses fzf for reliable mouse/keyboard interaction
-# Loops so it comes back after each selection
+# Uses a single fzf instance with reload — fzf never exits,
+# so mouse tracking is managed cleanly with no escape sequence leaks.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SELF="$SCRIPT_DIR/$(basename "$0")"
 DEV_DIR="$HOME/dev"
 
 get_main_client() {
@@ -16,7 +17,7 @@ format_sessions() {
         if [ "$attached" = "1" ]; then
             printf "● %-18s %s\n" "$name" "$short_path"
         else
-            printf "  %-18s %s\n" "$name" "$short_path"
+            printf "○ %-18s %s\n" "$name" "$short_path"
         fi
     done
 }
@@ -83,8 +84,6 @@ pick_project() {
     )
 
     if [ -z "$project" ]; then
-        echo "No project selected."
-        sleep 1
         return
     fi
 
@@ -118,8 +117,6 @@ pick_project() {
     )
 
     if [ -z "$choice" ]; then
-        echo "No option selected."
-        sleep 1
         return
     fi
 
@@ -207,82 +204,64 @@ pick_project() {
     esac
 }
 
-# Main loop
-while true; do
-    clear
-    sessions=$(format_sessions)
+# ── Action dispatch — called by fzf bindings via $SELF --action-* ──
 
-    if [ -z "$sessions" ]; then
-        echo "No active sessions."
-        echo ""
-        echo "Press Enter to create one, or Ctrl-C to quit."
-        read -r
-        pick_project
-        continue
-    fi
-
-    PICKER_KEY=$(mktemp)
-    echo "" > "$PICKER_KEY"
-
-    choice=$(echo "$sessions" | fzf \
-        --header="n:new  x:kill  q:quit" \
-        --no-sort \
-        --cycle \
-        --reverse \
-        --no-info \
-        --bind="n:execute-silent(echo n > $PICKER_KEY)+abort" \
-        --bind="x:execute-silent(echo x > $PICKER_KEY)+accept" \
-        --bind="q:execute-silent(echo q > $PICKER_KEY)+abort" \
-        --prompt="▶ " \
-        --pointer="→" \
-        --color="pointer:green,prompt:green" \
-    )
-
-    key=$(cat "$PICKER_KEY" 2>/dev/null)
-    rm -f "$PICKER_KEY"
-    selected_name=$(echo "$choice" | sed 's/^[● ]*//' | awk '{print $1}')
-
-    case "$key" in
-        q)
-            # Detach the tmux client in the right pane — this exits the
-            # "tmux attach" command that dev-start launched, closing the shell
-            # and the Ghostty split with it
+case "${1:-}" in
+    --action-list)
+        format_sessions
+        exit 0
+        ;;
+    --action-switch)
+        name="$2"
+        if [ -n "$name" ]; then
+            client=$(get_main_client)
+            [ -n "$client" ] && tmux switch-client -c "$client" -t "$name" 2>/dev/null
+        fi
+        exit 0
+        ;;
+    --action-kill)
+        name="$2"
+        if [ -n "$name" ]; then
             client=$(get_main_client)
             if [ -n "$client" ]; then
-                tmux detach-client -t "$client" 2>/dev/null
-            fi
-            break
-            ;;
-        n)
-            pick_project
-            ;;
-        x)
-            if [ -n "$selected_name" ]; then
-                # If the main client is on this session, switch it elsewhere first
-                client=$(get_main_client)
-                if [ -n "$client" ]; then
-                    current=$(tmux display-message -t "$client" -p '#{session_name}' 2>/dev/null)
-                    if [ "$current" = "$selected_name" ]; then
-                        # Find another session to switch to
-                        other=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -v "^${selected_name}$" | grep -v '^_picker$' | head -1)
-                        if [ -n "$other" ]; then
-                            tmux switch-client -c "$client" -t "$other" 2>/dev/null
-                        else
-                            # Last session — detach instead of killing
-                            tmux detach-client -t "$client" 2>/dev/null
-                        fi
+                current=$(tmux display-message -t "$client" -p '#{session_name}' 2>/dev/null)
+                if [ "$current" = "$name" ]; then
+                    other=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -v "^${name}$" | grep -v '^_picker$' | head -1)
+                    if [ -n "$other" ]; then
+                        tmux switch-client -c "$client" -t "$other" 2>/dev/null
+                    else
+                        tmux detach-client -t "$client" 2>/dev/null
                     fi
                 fi
-                tmux kill-session -t "$selected_name" 2>/dev/null
             fi
-            ;;
-        *)
-            if [ -n "$selected_name" ]; then
-                client=$(get_main_client)
-                if [ -n "$client" ]; then
-                    tmux switch-client -c "$client" -t "$selected_name" 2>/dev/null
-                fi
-            fi
-            ;;
-    esac
-done
+            tmux kill-session -t "$name" 2>/dev/null
+        fi
+        exit 0
+        ;;
+    --action-new)
+        pick_project
+        exit 0
+        ;;
+    --action-quit)
+        client=$(get_main_client)
+        [ -n "$client" ] && tmux detach-client -t "$client" 2>/dev/null
+        exit 0
+        ;;
+esac
+
+# ── Main picker — single persistent fzf instance ──
+
+format_sessions | fzf \
+    --no-sort \
+    --cycle \
+    --reverse \
+    --no-info \
+    --header="n:new  x:kill  q:quit" \
+    --prompt="▶ " \
+    --pointer="→" \
+    --color="pointer:green,prompt:green" \
+    --bind "enter:execute-silent($SELF --action-switch {2})+reload($SELF --action-list)" \
+    --bind "double-click:execute-silent($SELF --action-switch {2})+reload($SELF --action-list)" \
+    --bind "x:execute-silent($SELF --action-kill {2})+reload($SELF --action-list)" \
+    --bind "n:execute($SELF --action-new)+reload($SELF --action-list)" \
+    --bind "q:execute-silent($SELF --action-quit)+abort"
