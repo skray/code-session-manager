@@ -12,13 +12,41 @@ get_main_client() {
 }
 
 format_sessions() {
-    tmux list-sessions -F '#{session_name}|#{session_path}|#{session_attached}' 2>/dev/null | grep -v '^_picker|' | while IFS='|' read -r name path attached; do
-        short_path=$(echo "$path" | sed "s|$HOME|~|")
-        if [ "$attached" = "1" ]; then
-            printf "● %-18s %s\n" "$name" "$short_path"
+    # Outputs NUL-separated multi-line items for fzf --read0 --multi-line
+    tmux list-sessions -F '#{session_name}|#{session_path}|#{session_attached}|#{session_activity}' 2>/dev/null | grep -v '^_picker|' | while IFS='|' read -r name path attached activity; do
+        # Git branch
+        branch=$(git -C "$path" branch --show-current 2>/dev/null)
+        [ -z "$branch" ] && branch="-"
+
+        # Pane count
+        panes=$(tmux list-panes -t "=$name" 2>/dev/null | wc -l | tr -d ' ')
+
+        # Idle time
+        now=$(date +%s)
+        idle=$((now - activity))
+        if [ "$idle" -lt 60 ]; then
+            idle_str="active"
+        elif [ "$idle" -lt 3600 ]; then
+            idle_str="$((idle / 60))m idle"
         else
-            printf "○ %-18s %s\n" "$name" "$short_path"
+            idle_str="$((idle / 3600))h idle"
         fi
+
+        # Line 1: status + name
+        if [ "$attached" = "1" ]; then
+            printf "● %s\n" "$name"
+        else
+            printf "○ %s\n" "$name"
+        fi
+
+        # Line 2: branch (dimmed)
+        printf "  \033[2m⎇ %s\033[0m\n" "$branch"
+
+        # Line 3: panes + idle (dimmed)
+        printf "  \033[2m%s panes · %s\033[0m" "$panes" "$idle_str"
+
+        # NUL separator between items
+        printf '\0'
     done
 }
 
@@ -211,8 +239,14 @@ case "${1:-}" in
         format_sessions
         exit 0
         ;;
+    --action-name)
+        # Extract session name from first line of multi-line fzf item
+        # First line format: "● name" or "○ name"
+        echo "$2" | head -1 | awk '{print $2}'
+        exit 0
+        ;;
     --action-switch)
-        name="$2"
+        name=$("$SELF" --action-name "$2")
         if [ -n "$name" ]; then
             client=$(get_main_client)
             [ -n "$client" ] && tmux switch-client -c "$client" -t "$name" 2>/dev/null
@@ -220,7 +254,7 @@ case "${1:-}" in
         exit 0
         ;;
     --action-kill)
-        name="$2"
+        name=$("$SELF" --action-name "$2")
         if [ -n "$name" ]; then
             client=$(get_main_client)
             if [ -n "$client" ]; then
@@ -247,11 +281,39 @@ case "${1:-}" in
         [ -n "$client" ] && tmux detach-client -t "$client" 2>/dev/null
         exit 0
         ;;
+    --action-preview)
+        name="$2"
+        path=$(tmux list-sessions -F '#{session_name}|#{session_path}' 2>/dev/null | grep "^${name}|" | head -1 | cut -d'|' -f2)
+        [ -z "$path" ] && exit 0
+
+        short_path=$(echo "$path" | sed "s|$HOME|~|")
+        echo "$short_path"
+        echo ""
+
+        if git -C "$path" rev-parse --git-dir &>/dev/null; then
+            status=$(git -C "$path" status --short 2>/dev/null | head -15)
+            if [ -n "$status" ]; then
+                echo "Changes:"
+                echo "$status"
+                echo ""
+            else
+                echo "Working tree clean"
+                echo ""
+            fi
+
+            echo "Recent commits:"
+            git -C "$path" log --oneline -5 2>/dev/null
+        fi
+        exit 0
+        ;;
 esac
 
 # ── Main picker — single persistent fzf instance ──
 
 format_sessions | fzf \
+    --read0 \
+    --multi-line \
+    --ansi \
     --no-sort \
     --cycle \
     --reverse \
@@ -260,8 +322,10 @@ format_sessions | fzf \
     --prompt="▶ " \
     --pointer="→" \
     --color="pointer:green,prompt:green" \
-    --bind "enter:execute-silent($SELF --action-switch {2})+reload($SELF --action-list)" \
-    --bind "double-click:execute-silent($SELF --action-switch {2})+reload($SELF --action-list)" \
-    --bind "x:execute-silent($SELF --action-kill {2})+reload($SELF --action-list)" \
-    --bind "n:execute($SELF --action-new)+reload($SELF --action-list)" \
+    --preview "name=\$(echo {} | head -1 | awk '{print \$2}'); $SELF --action-preview \"\$name\"" \
+    --preview-window "bottom,40%" \
+    --bind "enter:execute-silent($SELF --action-switch {})+reload:$SELF --action-list" \
+    --bind "double-click:execute-silent($SELF --action-switch {})+reload:$SELF --action-list" \
+    --bind "x:execute-silent($SELF --action-kill {})+reload:$SELF --action-list" \
+    --bind "n:execute($SELF --action-new)+reload:$SELF --action-list" \
     --bind "q:execute-silent($SELF --action-quit)+abort"
