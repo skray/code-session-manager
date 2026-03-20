@@ -21,35 +21,28 @@ tmux kill-session -t _picker 2>/dev/null
 # Find first non-picker session
 first_session=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -v '^_picker$' | head -1)
 
-# Use AppleScript to set up the Ghostty window with two panes
+# Use Ghostty's native AppleScript API to set up the window
 osascript <<EOF
 tell application "Ghostty"
     activate
-end tell
 
-delay 0.5
+    set pickerCfg to new surface configuration
+    set environment variables of pickerCfg to {"PATH=$PATH"}
+    set command of pickerCfg to "$SCRIPT_DIR/dev-picker"
 
-tell application "System Events"
-    tell process "Ghostty"
-        -- Type picker command in the first (left) pane
-        keystroke "$SCRIPT_DIR/dev-picker"
-        key code 36 -- Enter
+    set tmuxCfg to new surface configuration
+    set environment variables of tmuxCfg to {"PATH=$PATH"}
+    set command of tmuxCfg to "tmux attach -t $first_session"
 
-        -- Cmd+D to split right
-        delay 0.3
-        keystroke "d" using command down
+    set win to new window with configuration pickerCfg
+    set pickerPane to terminal 1 of selected tab of win
+    set tmuxPane to split pickerPane direction right with configuration tmuxCfg
 
-        -- Type tmux attach in the right pane
-        delay 0.3
-        keystroke "exec tmux attach -t $first_session"
-        key code 36 -- Enter
+    -- Shrink the picker (left) pane
+    repeat 15 times
+        perform action "resize_split:left,10" on pickerPane
+    end repeat
 
-        -- Resize: shrink the left pane by pressing Cmd+Ctrl+Left several times
-        delay 0.3
-        repeat 15 times
-            key code 123 using {command down, control down}
-            delay 0.05
-        end repeat
-    end tell
+    focus tmuxPane
 end tell
 EOF
