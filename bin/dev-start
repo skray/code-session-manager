@@ -21,28 +21,26 @@ tmux kill-session -t _picker 2>/dev/null
 # Find first non-picker session
 first_session=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -v '^_picker$' | head -1)
 
-# Use Ghostty's native AppleScript API to set up the window
+# Use Ghostty's native AppleScript API to split the current window
 osascript <<EOF
 tell application "Ghostty"
-    activate
-
-    set pickerCfg to new surface configuration
-    set environment variables of pickerCfg to {"PATH=$PATH"}
-    set command of pickerCfg to "$SCRIPT_DIR/dev-picker"
+    set win to front window
+    set currentPane to terminal 1 of selected tab of win
 
     set tmuxCfg to new surface configuration
     set environment variables of tmuxCfg to {"PATH=$PATH"}
     set command of tmuxCfg to "tmux attach -t $first_session"
 
-    set win to new window with configuration pickerCfg
-    set pickerPane to terminal 1 of selected tab of win
-    set tmuxPane to split pickerPane direction right with configuration tmuxCfg
+    set tmuxPane to split currentPane direction right with configuration tmuxCfg
 
     -- Shrink the picker (left) pane
     repeat 15 times
-        perform action "resize_split:left,10" on pickerPane
+        perform action "resize_split:left,10" on currentPane
     end repeat
 
     focus tmuxPane
 end tell
 EOF
+
+# Replace this shell with the picker process
+exec "$SCRIPT_DIR/dev-picker"
