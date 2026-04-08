@@ -77,7 +77,7 @@ create_session() {
 
     tmux split-window -t "$name" -v -c "$dir"
     tmux resize-pane -t "$name:1.1" -y 70%
-    tmux send-keys -t "$name:1.1" 'claude --dangerously-skip-permissions' Enter
+    tmux send-keys -t "$name:1.1" 'claude' Enter
 
     "$SCRIPT_DIR/dev-code-switch" "$dir"
 
@@ -115,33 +115,53 @@ pick_project() {
         return
     fi
 
-    # Step 2: Build options list
-    local options=""
-    options="Open directly"$'\n'"New worktree"
-
-    # Find existing worktrees for this project
-    local worktrees=""
+    # Step 2: Build branch list — worktrees marked, all local+remote branches available
+    local worktree_branches=""
     if [ -d "$DEV_DIR/$project" ] && git -C "$DEV_DIR/$project" rev-parse --git-dir &>/dev/null; then
-        worktrees=$(git -C "$DEV_DIR/$project" worktree list --porcelain 2>/dev/null | awk -v main="$DEV_DIR/$project" '
+        worktree_branches=$(git -C "$DEV_DIR/$project" worktree list --porcelain 2>/dev/null | awk -v main="$DEV_DIR/$project" '
             /^worktree / { path = substr($0, 10) }
             /^branch /   { if (path != main && path !~ /\/.codex\//) print substr($0, 19) }
         ')
     fi
 
-    if [ -n "$worktrees" ]; then
-        options="$options"$'\n'"$worktrees"
+    local all_branches=""
+    if git -C "$DEV_DIR/$project" rev-parse --git-dir &>/dev/null; then
+        all_branches=$( {
+            git -C "$DEV_DIR/$project" branch --format='%(refname:short)' 2>/dev/null
+            git -C "$DEV_DIR/$project" branch -r --format='%(refname:short)' 2>/dev/null \
+                | sed 's|^origin/||' | grep -v '^HEAD$'
+        } | sort -u )
     fi
 
-    # Step 3: Pick an option
+    local options="Open directly"
+    local wt_set=$'\n'
+    while IFS= read -r b; do
+        [ -n "$b" ] || continue
+        options+=$'\n'"$b (worktree)"
+        wt_set+="$b"$'\n'
+    done <<< "$worktree_branches"
+
+    while IFS= read -r b; do
+        [ -n "$b" ] || continue
+        case "$wt_set" in *$'\n'"$b"$'\n'*) continue ;; esac
+        options+=$'\n'"$b"
+    done <<< "$all_branches"
+
+    # Step 3: Pick branch or type a new one
+    # enter: select focused item, or use query if list is empty
+    # ctrl-n: always use query as new branch name (bypasses fuzzy matches)
     local choice
     choice=$(echo "$options" | fzf \
-        --header="── $project ──────────" \
+        --header="── $project ──────────
+enter:select  ctrl-n:new branch" \
         --no-sort \
         --reverse \
         --no-info \
-        --prompt="▶ " \
+        --prompt="branch ▶ " \
         --pointer="→" \
         --color="pointer:green,prompt:green" \
+        --bind 'enter:accept-non-empty+become(echo {q})' \
+        --bind 'ctrl-n:become(echo {q})' \
     )
 
     if [ -z "$choice" ]; then
@@ -152,14 +172,22 @@ pick_project() {
         "Open directly")
             create_session "$project" "$DEV_DIR/$project"
             ;;
-        "New worktree")
-            printf "Branch name: "
-            read -r branch
-            if [ -z "$branch" ]; then
-                echo "No branch name entered."
-                sleep 1
-                return
+        *" (worktree)")
+            local branch="${choice% (worktree)}"
+            local wt_path
+            wt_path=$(git -C "$DEV_DIR/$project" worktree list --porcelain 2>/dev/null | awk -v b="$branch" '
+                /^worktree / { path = substr($0, 10) }
+                /^branch /   { if (substr($0, 8) == "refs/heads/" b) print path }
+            ' | head -1)
+            if [ -n "$wt_path" ] && [ -d "$wt_path" ]; then
+                create_session "$project/$branch" "$wt_path"
+            else
+                echo "ERROR: Could not find worktree: $branch"
+                sleep 2
             fi
+            ;;
+        *)
+            local branch="$choice"
 
             LOG="/tmp/dev-picker-debug.log"
             echo "=== $(date) ===" >> "$LOG"
@@ -211,22 +239,7 @@ pick_project() {
                 echo ""
                 echo "ERROR: Could not find worktree path for $branch (wt exit: $wt_exit)"
                 echo "Check log: $LOG"
-                read -rp "Press Enter to continue..."
-            fi
-            ;;
-        *)
-            # Selected an existing worktree — look up path by branch name
-            local wt_path
-            wt_path=$(git -C "$DEV_DIR/$project" worktree list --porcelain 2>/dev/null | awk -v b="$choice" '
-                /^worktree / { path = substr($0, 10) }
-                /^branch /   { if (substr($0, 8) == "refs/heads/" b) print path }
-            ' | head -1)
-            if [ -n "$wt_path" ] && [ -d "$wt_path" ]; then
-                create_session "$project/$choice" "$wt_path"
-            else
-                echo ""
-                echo "ERROR: Could not find worktree: $choice"
-                read -rp "Press Enter to continue..."
+                sleep 3
             fi
             ;;
     esac
