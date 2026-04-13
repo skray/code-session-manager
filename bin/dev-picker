@@ -6,9 +6,79 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SELF="$SCRIPT_DIR/$(basename "$0")"
 DEV_DIR="$HOME/dev"
+CACHE_DIR="$HOME/.cache/dev-picker/pr"
 
 get_main_client() {
     tmux list-clients -F '#{client_tty}|#{session_name}' 2>/dev/null | grep -v '|_picker$' | head -1 | cut -d'|' -f1
+}
+
+read_pr_cache() {
+    local path="$1" branch="$2"
+    [ "$branch" = "-" ] && return
+
+    local remote_url slug
+    remote_url=$(git -C "$path" remote get-url origin 2>/dev/null) || return
+    case "$remote_url" in
+        git@github.com:*) slug="${remote_url#git@github.com:}" ;;
+        *github.com/*)    slug="${remote_url#*github.com/}" ;;
+        *)                return ;;
+    esac
+    slug="${slug%.git}"
+
+    local cache_file="$CACHE_DIR/${slug%%/*}/${slug#*/}/$branch.json"
+    [ -f "$cache_file" ] || return
+
+    local number review checks_pass checks_fail checks_pending human_comments bot_comments last_commenter last_comment_at
+    read -r number review checks_pass checks_fail checks_pending human_comments bot_comments last_commenter last_comment_at < <(
+        jq -r '[.number, .review, .checks_pass, .checks_fail, .checks_pending, .human_comments, .bot_comments, .last_commenter, .last_comment_at] | @tsv' "$cache_file" 2>/dev/null
+    ) || return
+
+    [ -z "$number" ] || [ "$number" = "null" ] && return
+
+    local review_icon
+    case "$review" in
+        MERGED)            review_icon="🔀" ;;
+        APPROVED)          review_icon="✅" ;;
+        CHANGES_REQUESTED) review_icon="🔄" ;;
+        *)                 review_icon="⏳" ;;
+    esac
+
+    # CI checks summary
+    local checks_str=""
+    local checks_total=$(( checks_pass + checks_fail + checks_pending ))
+    if [ "$checks_total" -gt 0 ]; then
+        if [ "$checks_fail" -gt 0 ]; then
+            checks_str="❌${checks_fail}/${checks_total}"
+        elif [ "$checks_pending" -gt 0 ]; then
+            checks_str="⏳${checks_pass}/${checks_total}✓"
+        else
+            checks_str="✓${checks_total}"
+        fi
+    fi
+
+    local time_str=""
+    if [ -n "$last_comment_at" ] && [ "$last_comment_at" != "null" ] && [ "$last_commenter" != "null" ]; then
+        local comment_epoch now_epoch ago
+        comment_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_comment_at" +%s 2>/dev/null) || comment_epoch=0
+        now_epoch=$(date +%s)
+        ago=$(( now_epoch - comment_epoch ))
+        if [ "$ago" -lt 3600 ]; then
+            time_str="$((ago / 60))m"
+        elif [ "$ago" -lt 86400 ]; then
+            time_str="$((ago / 3600))h"
+        else
+            time_str="$((ago / 86400))d"
+        fi
+    fi
+
+    local line="◉ #${number} ${review_icon}"
+    [ -n "$checks_str" ] && line+=" ${checks_str}"
+    line+=" 💬${human_comments} 🤖${bot_comments}"
+    if [ -n "$last_commenter" ] && [ "$last_commenter" != "null" ] && [ -n "$time_str" ]; then
+        line+=" · ${last_commenter} ${time_str}"
+    fi
+
+    printf "%s" "$line"
 }
 
 format_sessions() {
@@ -44,6 +114,13 @@ format_sessions() {
 
         # Line 3: panes + idle (dimmed)
         printf "  \033[2m%s panes · %s\033[0m" "$panes" "$idle_str"
+
+        # Line 4: PR status (only if cached data exists)
+        local pr_line
+        pr_line=$(read_pr_cache "$path" "$branch")
+        if [ -n "$pr_line" ]; then
+            printf "\n  \033[2m%s\033[0m" "$pr_line"
+        fi
 
         # NUL separator between items
         printf '\0'
@@ -316,12 +393,92 @@ case "${1:-}" in
 
             echo "Recent commits:"
             git -C "$path" log --oneline -5 2>/dev/null
+
+            # PR details from cache
+            branch=$(git -C "$path" branch --show-current 2>/dev/null)
+            if [ -n "$branch" ]; then
+                remote_url=$(git -C "$path" remote get-url origin 2>/dev/null)
+                case "$remote_url" in
+                    git@github.com:*) slug="${remote_url#git@github.com:}" ;;
+                    *github.com/*)    slug="${remote_url#*github.com/}" ;;
+                    *)                slug="" ;;
+                esac
+                if [ -n "$slug" ]; then
+                    slug="${slug%.git}"
+                    cache_file="$CACHE_DIR/${slug%%/*}/${slug#*/}/$branch.json"
+                    if [ -f "$cache_file" ]; then
+                        echo ""
+                        echo "Pull Request:"
+                        jq -r '"  #\(.number) \(.title)",
+                                "  \(.url)",
+                                "  Review: \(.review // "PENDING")",
+                                "  Checks: \(.checks_pass // 0) passed, \(.checks_fail // 0) failed, \(.checks_pending // 0) pending",
+                                "  Comments: \(.human_comments // 0) human, \(.bot_comments // 0) bot"' \
+                            "$cache_file" 2>/dev/null
+                    fi
+                fi
+            fi
         fi
+        exit 0
+        ;;
+    --action-open-pr)
+        name=$("$SELF" --action-name "$2")
+        path=$(tmux list-sessions -F '#{session_name}|#{session_path}' 2>/dev/null | grep "^${name}|" | head -1 | cut -d'|' -f2)
+        [ -z "$path" ] && exit 0
+        branch=$(git -C "$path" branch --show-current 2>/dev/null)
+        [ -z "$branch" ] && exit 0
+        remote_url=$(git -C "$path" remote get-url origin 2>/dev/null) || exit 0
+        case "$remote_url" in
+            git@github.com:*) slug="${remote_url#git@github.com:}" ;;
+            *github.com/*)    slug="${remote_url#*github.com/}" ;;
+            *)                exit 0 ;;
+        esac
+        slug="${slug%.git}"
+        cache_file="$CACHE_DIR/${slug%%/*}/${slug#*/}/$branch.json"
+        [ -f "$cache_file" ] || exit 0
+        url=$(jq -r '.url // empty' "$cache_file" 2>/dev/null)
+        [ -n "$url" ] && open "$url"
+        exit 0
+        ;;
+    --action-header)
+        age_str=""
+        if [ -d "$CACHE_DIR" ]; then
+            newest_mtime=$(find "$CACHE_DIR" -name '*.json' -exec stat -f%m {} + 2>/dev/null | sort -rn | head -1)
+            if [ -n "$newest_mtime" ]; then
+                now_ts=$(date +%s)
+                age=$(( now_ts - newest_mtime ))
+                if [ "$age" -lt 60 ]; then
+                    age_str="  ↻${age}s"
+                elif [ "$age" -lt 3600 ]; then
+                    age_str="  ↻$((age / 60))m"
+                else
+                    age_str="  ↻$((age / 3600))h"
+                fi
+            fi
+        fi
+        echo "n:new  x:kill  o:pr  q:quit${age_str}"
+        exit 0
+        ;;
+    --action-bg-refresh)
+        SOCK="/tmp/dev-picker.sock"
+        while true; do
+            "$SCRIPT_DIR/dev-pr-cache" --all 2>/dev/null
+            if [ -S "$SOCK" ]; then
+                curl --unix-socket "$SOCK" localhost -s -XPOST \
+                    -d "reload($SELF --action-list)" 2>/dev/null
+                header=$("$SELF" --action-header)
+                curl --unix-socket "$SOCK" localhost -s -XPOST \
+                    -d "change-header($header)" 2>/dev/null
+            fi
+            sleep 300
+        done
         exit 0
         ;;
 esac
 
 # ── Main picker — single persistent fzf instance ──
+
+trap 'rm -f /tmp/dev-picker.sock; kill 0 2>/dev/null' EXIT
 
 format_sessions | fzf \
     --read0 \
@@ -331,14 +488,17 @@ format_sessions | fzf \
     --cycle \
     --reverse \
     --no-info \
-    --header="n:new  x:kill  q:quit" \
+    --listen=/tmp/dev-picker.sock \
+    --header="n:new  x:kill  o:pr  q:quit" \
     --prompt="▶ " \
     --pointer="→" \
     --color="pointer:green,prompt:green" \
     --preview "name=\$(echo {} | head -1 | awk '{print \$2}'); $SELF --action-preview \"\$name\"" \
     --preview-window "bottom,40%" \
-    --bind "enter:execute-silent($SELF --action-switch {})+reload:$SELF --action-list" \
-    --bind "double-click:execute-silent($SELF --action-switch {})+reload:$SELF --action-list" \
-    --bind "x:execute-silent($SELF --action-kill {})+reload:$SELF --action-list" \
-    --bind "n:execute($SELF --action-new)+reload:$SELF --action-list" \
+    --bind "start:execute-silent($SELF --action-bg-refresh &)" \
+    --bind "enter:execute-silent($SELF --action-switch {})+reload($SELF --action-list)+transform-header($SELF --action-header)" \
+    --bind "double-click:execute-silent($SELF --action-switch {})+reload($SELF --action-list)+transform-header($SELF --action-header)" \
+    --bind "x:execute-silent($SELF --action-kill {})+reload($SELF --action-list)+transform-header($SELF --action-header)" \
+    --bind "n:execute($SELF --action-new)+reload($SELF --action-list)+transform-header($SELF --action-header)" \
+    --bind "o:execute-silent($SELF --action-open-pr {})" \
     --bind "q:execute-silent($SELF --action-quit)+abort"

@@ -1,0 +1,183 @@
+#!/bin/bash
+# Fetch GitHub PR data for active tmux sessions and write JSON cache files.
+# Usage:
+#   dev-pr-cache <path> <branch>   # Cache one repo/branch
+#   dev-pr-cache --all             # Cache all active tmux sessions
+
+CACHE_DIR="$HOME/.cache/dev-picker/pr"
+
+# Guard clauses — exit silently if dependencies missing
+command -v gh  >/dev/null || exit 0
+command -v jq  >/dev/null || exit 0
+gh auth status &>/dev/null || exit 0
+
+GH_USER=$(gh api user --jq '.login' 2>/dev/null)
+
+parse_remote() {
+    local path="$1"
+    local url
+    url=$(git -C "$path" remote get-url origin 2>/dev/null) || return 1
+    local slug
+    case "$url" in
+        git@github.com:*) slug="${url#git@github.com:}" ;;
+        *github.com/*)    slug="${url#*github.com/}" ;;
+        *)                return 1 ;;
+    esac
+    slug="${slug%.git}"
+    echo "$slug"
+}
+
+fetch_pr() {
+    local owner="$1" repo="$2" branch="$3"
+
+    local pr_fields='
+        number
+        url
+        title
+        state
+        reviewDecision
+        comments(last: 50) {
+            nodes {
+                author { login __typename }
+                createdAt
+            }
+        }
+        reviews(last: 20) {
+            nodes {
+                author { login __typename }
+                createdAt
+                body
+            }
+        }
+        reviewThreads(last: 30) {
+            nodes {
+                comments(last: 10) {
+                    nodes {
+                        author { login __typename }
+                        createdAt
+                    }
+                }
+            }
+        }
+        commits(last: 1) {
+            nodes {
+                commit {
+                    statusCheckRollup {
+                        contexts(first: 50) {
+                            nodes {
+                                __typename
+                                ... on CheckRun { conclusion }
+                                ... on StatusContext { state }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    '
+    local result
+    result=$(gh api graphql \
+        -f owner="$owner" \
+        -f repo="$repo" \
+        -f headBranch="$branch" \
+        -f query="
+            query(\$owner: String!, \$repo: String!, \$headBranch: String!) {
+                repository(owner: \$owner, name: \$repo) {
+                    open: pullRequests(first: 1, headRefName: \$headBranch, states: OPEN) {
+                        nodes { $pr_fields }
+                    }
+                    merged: pullRequests(first: 1, headRefName: \$headBranch, states: MERGED, orderBy: {field: UPDATED_AT, direction: DESC}) {
+                        nodes { $pr_fields }
+                    }
+                }
+            }
+        " 2>/dev/null) || return 1
+
+    # Prefer open PR, fall back to most recent merged
+    # Combine all comment sources: top-level comments, review submissions, and inline review thread comments
+    local cache_json
+    cache_json=$(echo "$result" | jq --arg me "$GH_USER" '
+        (.data.repository.open.nodes[0] // .data.repository.merged.nodes[0]) // empty |
+        # Gather all comments from all sources into one flat list
+        # Exclude empty-body reviews — those are just submission wrappers for inline comments already in reviewThreads
+        (
+            [.comments.nodes[] | {login: .author.login, type: .author.__typename, at: .createdAt}] +
+            [.reviews.nodes[] | select(.body != null and .body != "") | {login: .author.login, type: .author.__typename, at: .createdAt}] +
+            [.reviewThreads.nodes[].comments.nodes[] | {login: .author.login, type: .author.__typename, at: .createdAt}]
+        ) as $all |
+        ($all | [.[] | select(.type != "Bot" and .login != $me)] | sort_by(.at)) as $human |
+        ($all | [.[] | select(.type == "Bot")] | sort_by(.at)) as $bot |
+        # Check run results
+        (
+            [.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[] // empty |
+                if .__typename == "CheckRun" then .conclusion
+                else .state end
+            ] // []
+        ) as $checks |
+        {
+            number: .number,
+            url: .url,
+            title: .title,
+            review: (if .state == "MERGED" then "MERGED" else (.reviewDecision // "PENDING") end),
+            checks_pass: ([$checks[] | select(. == "SUCCESS")] | length),
+            checks_fail: ([$checks[] | select(. == "FAILURE" or . == "ERROR")] | length),
+            checks_pending: ([$checks[] | select(. == null or . == "PENDING" or . == "NEUTRAL" or . == "EXPECTED")] | length),
+            human_comments: ($human | length),
+            bot_comments: ($bot | length),
+            last_commenter: ($human | last | .login // null),
+            last_comment_at: ($human | last | .at // null)
+        }
+    ' 2>/dev/null) || return 1
+
+    [ -z "$cache_json" ] && return 1
+
+    # Atomic write
+    local cache_file="$CACHE_DIR/$owner/$repo/$branch.json"
+    mkdir -p "$(dirname "$cache_file")"
+    local tmp
+    tmp=$(mktemp) || return 1
+    echo "$cache_json" > "$tmp"
+    mv "$tmp" "$cache_file"
+}
+
+cache_one() {
+    local path="$1" branch="$2"
+    [ -z "$branch" ] || [ "$branch" = "-" ] && return 0
+
+    local slug
+    slug=$(parse_remote "$path") || return 0
+    local owner="${slug%%/*}"
+    local repo="${slug#*/}"
+
+    fetch_pr "$owner" "$repo" "$branch"
+}
+
+cache_all() {
+    local sessions=()
+    while IFS='|' read -r _name path; do
+        local branch
+        branch=$(git -C "$path" branch --show-current 2>/dev/null)
+        [ -z "$branch" ] && continue
+        sessions+=("$path|$branch")
+    done < <(tmux list-sessions -F '#{session_name}|#{session_path}' 2>/dev/null | grep -v '^_picker|')
+
+    for entry in "${sessions[@]}"; do
+        cache_one "${entry%%|*}" "${entry#*|}"
+    done
+}
+
+# ── Entry point ──
+
+case "${1:-}" in
+    --all)
+        cache_all
+        ;;
+    *)
+        if [ -n "${1:-}" ] && [ -n "${2:-}" ]; then
+            cache_one "$1" "$2"
+        else
+            echo "Usage: dev-pr-cache --all | dev-pr-cache <path> <branch>" >&2
+            exit 1
+        fi
+        ;;
+esac
