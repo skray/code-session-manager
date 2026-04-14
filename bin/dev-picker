@@ -346,6 +346,9 @@ case "${1:-}" in
     --action-kill)
         name=$("$SELF" --action-name "$2")
         if [ -n "$name" ]; then
+            # Get session path before killing so we can close the VS Code window
+            session_path=$(tmux list-sessions -F '#{session_name}|#{session_path}' 2>/dev/null | grep "^${name}|" | head -1 | cut -d'|' -f2)
+
             client=$(get_main_client)
             if [ -n "$client" ]; then
                 current=$(tmux display-message -t "$client" -p '#{session_name}' 2>/dev/null)
@@ -359,6 +362,20 @@ case "${1:-}" in
                 fi
             fi
             tmux kill-session -t "$name" 2>/dev/null
+
+            # Close the corresponding VS Code window
+            if [ -n "$session_path" ]; then
+                osascript -e "
+                    tell application \"Visual Studio Code\"
+                        repeat with w in (every window)
+                            if name of w contains \"$(basename "$session_path")\" then
+                                close w
+                                exit repeat
+                            end if
+                        end repeat
+                    end tell
+                " 2>/dev/null &
+            fi
         fi
         exit 0
         ;;
