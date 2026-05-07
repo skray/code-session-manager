@@ -287,14 +287,40 @@ enter:select  ctrl-n:new branch" \
                 echo "Branch does not exist" >> "$LOG"
             fi
 
+            # Pick base branch for new branches
+            local base_branch="origin/main"
+            if [ "$branch_exists" = false ]; then
+                local remote_branches
+                remote_branches=$(git -C "$DEV_DIR/$project" branch -r --format='%(refname:short)' 2>/dev/null \
+                    | grep -v '/HEAD$' | sort)
+                # Put origin/main first so it's the default selection
+                remote_branches=$(echo "$remote_branches" | grep -v '^origin/main$')
+                remote_branches="origin/main"$'\n'"$remote_branches"
+                local picked_base
+                picked_base=$(echo "$remote_branches" | fzf \
+                    --header="── base branch ──────────
+Base branch for new worktree (Esc = origin/main)" \
+                    --no-sort \
+                    --reverse \
+                    --no-info \
+                    --prompt="base ▶ " \
+                    --pointer="→" \
+                    --color="pointer:green,prompt:green" \
+                )
+                if [ -n "$picked_base" ]; then
+                    base_branch="$picked_base"
+                fi
+                echo "base_branch=$base_branch" >> "$LOG"
+            fi
+
             # Run wt with visible output so user sees progress (npm install, etc.)
             echo "Creating worktree for $branch..."
             if [ "$branch_exists" = true ]; then
                 echo "Running: wt switch $branch --no-cd --yes" >> "$LOG"
                 (cd "$DEV_DIR/$project" && wt switch "$branch" --no-cd --yes 2>&1) | tee -a "$LOG"
             else
-                echo "Running: wt switch --create $branch --base origin/main --no-cd --yes" >> "$LOG"
-                (cd "$DEV_DIR/$project" && wt switch --create "$branch" --base origin/main --no-cd --yes 2>&1) | tee -a "$LOG"
+                echo "Running: wt switch --create $branch --base $base_branch --no-cd --yes" >> "$LOG"
+                (cd "$DEV_DIR/$project" && wt switch --create "$branch" --base "$base_branch" --no-cd --yes 2>&1) | tee -a "$LOG"
             fi
             local wt_exit=${PIPESTATUS[0]}
             echo "wt exit code: $wt_exit" >> "$LOG"
@@ -361,6 +387,9 @@ case "${1:-}" in
                     fi
                 fi
             fi
+            # Spin down docker containers and remove worktree
+            (cd "$session_path" && wt remove . 2>/dev/null) &
+
             tmux kill-session -t "$name" 2>/dev/null
 
             # Close the corresponding VS Code window
@@ -381,6 +410,14 @@ case "${1:-}" in
         ;;
     --action-new)
         pick_project
+        exit 0
+        ;;
+    --action-active-name)
+        # Get the session name currently attached to the main client
+        client=$(get_main_client)
+        if [ -n "$client" ]; then
+            tmux display-message -t "$client" -p '#{session_name}' 2>/dev/null
+        fi
         exit 0
         ;;
     --action-quit)
@@ -510,12 +547,12 @@ format_sessions | fzf \
     --prompt="▶ " \
     --pointer="→" \
     --color="pointer:green,prompt:green" \
-    --preview "name=\$(echo {} | head -1 | awk '{print \$2}'); $SELF --action-preview \"\$name\"" \
+    --preview "name=\$($SELF --action-active-name); $SELF --action-preview \"\$name\"" \
     --preview-window "bottom,40%" \
     --bind "start:execute-silent($SELF --action-bg-refresh &)" \
-    --bind "enter:execute-silent($SELF --action-switch {})+reload($SELF --action-list)+transform-header($SELF --action-header)" \
-    --bind "double-click:execute-silent($SELF --action-switch {})+reload($SELF --action-list)+transform-header($SELF --action-header)" \
-    --bind "x:execute-silent($SELF --action-kill {})+reload($SELF --action-list)+transform-header($SELF --action-header)" \
-    --bind "n:execute($SELF --action-new)+reload($SELF --action-list)+transform-header($SELF --action-header)" \
+    --bind "enter:execute-silent($SELF --action-switch {})+reload($SELF --action-list)+transform-header($SELF --action-header)+refresh-preview" \
+    --bind "double-click:execute-silent($SELF --action-switch {})+reload($SELF --action-list)+transform-header($SELF --action-header)+refresh-preview" \
+    --bind "x:execute-silent($SELF --action-kill {})+reload($SELF --action-list)+transform-header($SELF --action-header)+refresh-preview" \
+    --bind "n:execute($SELF --action-new)+reload($SELF --action-list)+transform-header($SELF --action-header)+refresh-preview" \
     --bind "o:execute-silent($SELF --action-open-pr {})" \
     --bind "q:execute-silent($SELF --action-quit)+abort"
